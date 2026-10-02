@@ -161,7 +161,7 @@ driver and original reservation; the enrolled MOK remains.
 | 4 KiB kernel | ~125,370,544 KiB / 119.56 GiB | — |
 | 64 KiB kernel | 127,570,560 KiB / 121.66 GiB | 2,200,016 KiB / 2.098 GiB |
 | 64 KiB kernel, crash-kernel reservation removed | 129,798,784 KiB / 123.79 GiB | 2,228,224 KiB / 2.125 GiB |
-| After display reclaim | 131,893,888 KiB / 125.78 GiB | 2,095,104 KiB / 2046 MiB |
+| After display reclaim | 131,893,888 KiB / 125.78 GiB | 2,095,104 KiB / 1.998 GiB |
 
 The 64 KiB kernel and display reclaim together add **4,295,120 KiB
 (4.096 GiB)**. Removing the crash-kernel reservation is a separate change.
