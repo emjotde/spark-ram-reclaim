@@ -11,7 +11,9 @@ Together they add **4.096 GiB** to `MemTotal`.
 
 ## 1. Install the 64 KiB kernel
 
-Install the exact kernel, NVIDIA modules, headers, and tools:
+NVIDIA documents the supported procedure in
+[Installing the 64K Kernel](https://docs.nvidia.com/dgx/dgx-os-7-user-guide/installing_on_ubuntu.html).
+Install the exact tested kernel, NVIDIA modules, headers, and tools:
 
 ```sh
 sudo apt-get update
