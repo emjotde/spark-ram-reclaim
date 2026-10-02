@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+set -Eeuo pipefail
+
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+stage=${GB10_RECLAIM_STAGE:-/root/.local/share/gb10-ram-reclaim/signed}
+expected_kernel=7.0.0-1019-nvidia-64k
+expected_delta_kb=2095104
+reclaim_modules=(gb10_reclaim_probe gb10_reclaim_left gb10_reclaim_right)
+
+usage()
+{
+    printf 'Usage: %s {status|reclaim} [--dry-run]\n' "${0##*/}"
+}
+
+loaded()
+{
+    test -d "/sys/module/$1"
+}
+
+status()
+{
+    local count=0 module
+    for module in "${reclaim_modules[@]}"; do
+        loaded "$module" && count=$((count + 1))
+    done
+    case "$count" in
+        0) printf 'mode=stock\n' ;;
+        3) printf 'mode=reclaim\n' ;;
+        *) printf 'mode=partial\n' ;;
+    esac
+    awk '/^MemTotal:|^MemAvailable:/{gsub(":", "", $1); printf "%s=%s kB\n", $1, $2}' /proc/meminfo
+}
+
+require_file()
+{
+    test -f "$1" || { printf 'Missing: %s\n' "$1" >&2; exit 1; }
+}
+
+allocation_status()
+{
+    "$repo/build/allocation_probe" "$@"
+}
+
+kernel_errors()
+{
+    journalctl -k -b --since="@$1" --no-pager |
+        grep -E 'NVRM: Xid|Oops|BUG:|Kernel panic|NOMAP rollback failed'
+}
+
+reclaim()
+{
+    local dry_run=${1:-} started_at stock_kb before_kb after_kb output coverage
+    local module spec expected delta
+
+    if test "$dry_run" = --dry-run; then
+        printf '%s\n' \
+            'preflight' \
+            'verify reserved pages' \
+            'verify stock allocation paths' \
+            'unload NVIDIA modules' \
+            'run reversible mapping test' \
+            'load and verify guarded driver' \
+            'inspect and release 2 + 1022 + 1022 MiB' \
+            'verify MemTotal and CUDA coverage'
+        return
+    fi
+
+    test "$EUID" -eq 0 || { printf 'Run as root.\n' >&2; exit 2; }
+    test "$(uname -r)" = "$expected_kernel" || {
+        printf 'Unsupported kernel: %s\n' "$(uname -r)" >&2
+        exit 2
+    }
+
+    case "$(status | sed -n 's/^mode=//p')" in
+        reclaim) status; exit 0 ;;
+        partial) printf 'mode=partial\n' >&2; exit 1 ;;
+    esac
+
+    exec 9>/run/lock/spark-reclaim.lock
+    flock --exclusive --nonblock 9
+
+    require_file "$repo/tools/preflight.py"
+    require_file "$repo/build/allocation_probe"
+    require_file "$repo/build/cuda_coverage"
+    for module in nvidia-guarded "${reclaim_modules[@]}"; do
+        require_file "$stage/$module.ko"
+    done
+
+    python3 "$repo/tools/preflight.py"
+    (cd "$stage" && sha256sum -c SHA256SUMS)
+    if fuser /dev/nvidia* >/dev/null 2>&1; then
+        fuser -v /dev/nvidia* >&2 || true
+        printf 'NVIDIA devices are in use.\n' >&2
+        exit 1
+    fi
+
+    output=$(allocation_status)
+    printf '%s\n' "$output"
+    grep -q 'status=0x0' <<<"$output"
+    output=$(allocation_status iso)
+    printf '%s\n' "$output"
+    grep -q 'status=0x0' <<<"$output"
+
+    stock_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+    install -d /run/modprobe.d
+    cat > /run/modprobe.d/gb10-reclaim.conf <<'CONF'
+install nvidia /bin/false
+install nvidia_drm /bin/false
+install nvidia_modeset /bin/false
+CONF
+
+    started_at=$(date +%s)
+    for module in nvidia_drm nvidia_modeset nvidia_uvm nvidia; do
+        loaded "$module" && rmmod "$module"
+    done
+    if lsmod | grep -q '^nvidia'; then
+        printf 'NVIDIA modules remain loaded.\n' >&2
+        exit 1
+    fi
+
+    insmod "$stage/gb10_reclaim_probe.ko" \
+        map_test=1 expires=$(($(date +%s) + 60))
+    rmmod gb10_reclaim_probe
+    journalctl -k -b --since="@$started_at" --no-pager |
+        grep -q 'direct-map test result=0; pages remain reserved'
+
+    insmod "$stage/nvidia-guarded.ko"
+    nvidia-smi >/dev/null
+    output=$(allocation_status)
+    grep -q 'status=0x56' <<<"$output"
+    output=$(allocation_status iso)
+    grep -q 'status=0x56' <<<"$output"
+    loaded nvidia_uvm || insmod "$(modinfo -n nvidia_uvm)"
+
+    for module in "${reclaim_modules[@]}"; do
+        insmod "$stage/$module.ko" expires=$(($(date +%s) + 60))
+        rmmod "$module"
+    done
+
+    for spec in \
+            gb10_reclaim_probe:2048 \
+            gb10_reclaim_left:1046528 \
+            gb10_reclaim_right:1046528; do
+        module=${spec%%:*}
+        expected=${spec#*:}
+        before_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+        insmod "$stage/$module.ko" gb10_commit=1 \
+            expires=$(($(date +%s) + 60))
+        after_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+        delta=$((after_kb - before_kb))
+        test "$delta" -eq "$expected"
+        printf '%s: +%s kB\n' "$module" "$delta"
+        if kernel_errors "$started_at"; then
+            exit 1
+        fi
+    done
+
+    after_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+    test $((after_kb - stock_kb)) -eq "$expected_delta_kb"
+    test "$(grep -c 'System RAM (GB10 experiment)' /proc/iomem)" -eq 3
+
+    coverage=$("$repo/build/cuda_coverage" 16384)
+    printf '%s\n' "$coverage"
+    grep -q '^PASS:' <<<"$coverage"
+    if grep -q 'display_pool_pages=0' <<<"$coverage"; then
+        exit 1
+    fi
+    if kernel_errors "$started_at"; then
+        exit 1
+    fi
+    printf 'Reclaimed %s kB. MemTotal=%s kB.\n' "$expected_delta_kb" "$after_kb"
+}
+
+case "${1:-}" in
+    status)
+        test "$#" -eq 1 || { usage >&2; exit 2; }
+        status
+        ;;
+    reclaim)
+        test "$#" -le 2 || { usage >&2; exit 2; }
+        reclaim "${2:-}"
+        ;;
+    -h|--help)
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

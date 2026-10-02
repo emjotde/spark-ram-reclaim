@@ -1,0 +1,16 @@
+name: Host checks
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Unit tests and shell syntax
+        run: make test
+      - name: Disposable module-key workflow
+        run: sudo python3 -m unittest discover -s tests -p test_key_workflow.py -v
